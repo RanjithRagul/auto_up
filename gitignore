@@ -1,0 +1,8 @@
+# Ignore everything by default
+*
+
+# Allow traversing directories so nested .py files are not skipped
+!*/
+
+# Track all Python source files
+!*.py
