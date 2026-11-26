@@ -3,6 +3,7 @@ import ctypes
 import html as html_lib
 import json
 import os
+import random
 import re
 import socket
 import subprocess
@@ -12,8 +13,9 @@ from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 TARGET_URL = "https://www.upwork.com/nx/s/find-work/most-recent"
@@ -60,6 +62,18 @@ STRUCTURED_FIELDS = [
     "open_jobs",
     "member_since",
 ]
+
+CHALLENGE_MARKERS = (
+    "verify you are human",
+    "verify you're human",
+    "unusual traffic",
+    "automated requests",
+    "captcha",
+    "security check",
+    "access denied",
+    "temporarily blocked",
+    "just a moment",
+)
 
 
 class RECT(ctypes.Structure):
@@ -128,9 +142,9 @@ def position_edge_right_half_and_focus():
             user32.AttachThreadInput(cur_tid, tgt_tid, False)
 
 
-def is_port_open(host: str, port: int) -> bool:
+def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=0.5):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -160,7 +174,13 @@ def ensure_edge_remote_debugging_ready() -> str:
         position_edge_right_half_and_focus()
         return ws_url
 
-    print("[!] Enable remote debugging on edge://inspect/#remote-debugging in Edge...")
+    print("\n=================================================================")
+    print("[!] Edge Remote Debugging is currently OFF.")
+    print("    Opening edge://inspect/#remote-debugging in your Edge window...")
+    print("    1. Check the 'Enable remote debugging' box in that tab.")
+    print("    2. Wait until 'Server running at: 127.0.0.1:...' appears.")
+    print("=================================================================\n")
+
     subprocess.Popen(["cmd", "/c", "start", "", "msedge", "edge://inspect/#remote-debugging"])
     time.sleep(1.0)
     position_edge_right_half_and_focus()
@@ -169,8 +189,83 @@ def ensure_edge_remote_debugging_ready() -> str:
         time.sleep(1.5)
         ws_url = read_live_devtools_ws_url()
         if ws_url:
+            print(f"[+] Live Edge debugging server confirmed at: {ws_url}")
             position_edge_right_half_and_focus()
             return ws_url
+
+
+async def human_delay(min_sec: float = 1.5, max_sec: float = 4.0):
+    mean = (min_sec + max_sec) / 2
+    std_dev = (max_sec - min_sec) / 4
+    delay = max(min_sec, min(max_sec, random.gauss(mean, std_dev)))
+    await asyncio.sleep(delay)
+
+
+async def human_mouse_move(page, target_x: float, target_y: float, steps: int = 25):
+    start_x = random.randint(120, 750)
+    start_y = random.randint(120, 550)
+
+    ctrl_x = (start_x + target_x) / 2 + random.randint(-140, 140)
+    ctrl_y = (start_y + target_y) / 2 + random.randint(-140, 140)
+
+    for i in range(1, steps + 1):
+        t = i / steps
+        t_eased = t * t * (3 - 2 * t)
+        x = (1 - t_eased) ** 2 * start_x + 2 * (1 - t_eased) * t_eased * ctrl_x + t_eased ** 2 * target_x
+        y = (1 - t_eased) ** 2 * start_y + 2 * (1 - t_eased) * t_eased * ctrl_y + t_eased ** 2 * target_y
+        await page.mouse.move(x, y)
+        await asyncio.sleep(random.uniform(0.008, 0.022))
+
+
+async def human_click_element(page, locator):
+    await locator.scroll_into_view_if_needed()
+    await human_delay(0.5, 1.2)
+    box = await locator.bounding_box()
+    if box:
+        target_x = box["x"] + random.uniform(box["width"] * 0.25, box["width"] * 0.75)
+        target_y = box["y"] + random.uniform(box["height"] * 0.25, box["height"] * 0.75)
+        await human_mouse_move(page, target_x, target_y, steps=random.randint(20, 32))
+        await human_delay(0.2, 0.5)
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.14))
+        await page.mouse.up()
+    else:
+        await locator.click()
+
+
+async def human_scroll(page, scrolls: int = 3):
+    for _ in range(scrolls):
+        scroll_amount = random.randint(300, 680)
+        await page.mouse.wheel(0, scroll_amount)
+        await human_delay(0.8, 2.0)
+
+
+async def detect_challenge(page) -> str | None:
+    try:
+        title = (await page.title() or "").lower()
+        body = (await page.locator("body").inner_text(timeout=3000) or "").lower()
+    except Exception:
+        return None
+
+    sample = f"{title}\n{body[:15000]}"
+    for marker in CHALLENGE_MARKERS:
+        if marker in sample:
+            return marker
+    return None
+
+
+async def check_and_wait_for_captcha(page):
+    marker = await detect_challenge(page)
+    if marker or await page.locator("iframe[src*='challenges.cloudflare.com']").count() > 0:
+        position_edge_right_half_and_focus()
+        await page.bring_to_front()
+        print(f"\n[!] Security verification detected ({marker or 'captcha'}). Please complete it manually in Edge...")
+        while True:
+            await asyncio.sleep(2.0)
+            if not await detect_challenge(page) and await page.locator("iframe[src*='challenges.cloudflare.com']").count() == 0:
+                break
+        print("[+] Verification cleared! Resuming...\n")
+        await human_delay(2.0, 3.5)
 
 
 def canonical_job_url(href: str) -> str | None:
@@ -184,44 +279,109 @@ def canonical_job_url(href: str) -> str | None:
 
 
 async def ensure_logged_in(page):
-    await asyncio.sleep(2.0)
-    if "account-security/login" in page.url or await page.locator("input#login_username").count() > 0:
+    await check_and_wait_for_captcha(page)
+    await human_delay(2.0, 3.0)
+
+    needs_login = (
+        "account-security/login" in page.url
+        or await page.locator("input#login_username").count() > 0
+        or await page.locator("input#login_password").count() > 0
+    )
+
+    if needs_login:
         position_edge_right_half_and_focus()
         await page.bring_to_front()
-        print("[!] Please sign in to Upwork in Edge (checking 'Keep me logged in' helps)...")
+        print("\n=================================================================")
+        print("[!] NOT LOGGED IN")
+        print("    Please log in to Upwork in your Edge window now.")
+        print("    Script will resume automatically once you reach the Find Work feed.")
+        print("=================================================================\n")
+
         await page.wait_for_url("**/find-work/**", timeout=600000)
-        await asyncio.sleep(2.0)
+        await check_and_wait_for_captcha(page)
+        print("[+] Login detected! Resuming automation...\n")
+        await human_delay(2.0, 3.5)
 
 
 async def collect_visible_job_urls(page) -> list[str]:
-    raw_links = await page.evaluate("() => Array.from(document.querySelectorAll('a[href*=\"/jobs/\"]')).map(a => a.href)")
-    urls, seen = [], set()
+    raw_links = await page.evaluate("""() => {
+        const anchors = Array.from(document.querySelectorAll('a[href*="/jobs/"]'));
+        return anchors.map(a => a.href);
+    }""")
+
+    urls: list[str] = []
+    seen_ids: set[str] = set()
     for link in raw_links:
         canon = canonical_job_url(link)
         if canon:
-            jid = canon.rstrip("/").split("~")[-1]
-            if jid and jid not in seen:
-                seen.add(jid)
+            job_id = canon.rstrip("/").split("~")[-1]
+            if job_id and job_id not in seen_ids:
+                seen_ids.add(job_id)
                 urls.append(canon)
     return urls
 
 
-async def extract_job_urls(page, target_count: int = 1, max_clicks: int = 0) -> list[str]:
-    await page.wait_for_selector('a[href*="/jobs/"]', timeout=30000)
-    urls = await collect_visible_job_urls(page)
-    clicks = 0
-    while len(urls) < target_count and clicks < max_clicks:
-        clicks += 1
-        await page.mouse.wheel(0, 1200)
+async def click_load_more_jobs(page, previous_count: int) -> bool:
+    await human_scroll(page, scrolls=random.randint(3, 5))
+
+    load_more_btn = page.locator(
+        'button:has-text("Load More Jobs"), button:has-text("Load more jobs"), [data-test="load-more-button"]'
+    ).first
+
+    if await load_more_btn.count() == 0:
+        load_more_btn = page.get_by_role("button", name=re.compile(r"load\s+more", re.I)).first
+
+    if await load_more_btn.count() == 0 or not await load_more_btn.is_visible():
+        print("[!] 'Load More Jobs' button not found or not visible.")
+        return False
+
+    if await load_more_btn.is_disabled():
+        print("[!] 'Load More Jobs' button is currently disabled.")
+        return False
+
+    print("[*] Clicking 'Load More Jobs' button...")
+    await human_click_element(page, load_more_btn)
+    await check_and_wait_for_captcha(page)
+
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
         await asyncio.sleep(1.0)
-        btn = page.locator('button:has-text("Load More Jobs"), button:has-text("Load more jobs")').first
-        if await btn.count() > 0 and await btn.is_visible() and not await btn.is_disabled():
-            await btn.click()
-            await asyncio.sleep(2.5)
-            urls = await collect_visible_job_urls(page)
-        else:
+        current_urls = await collect_visible_job_urls(page)
+        if len(current_urls) > previous_count:
+            print(f"[+] Loaded more jobs! Total visible jobs now: {len(current_urls)}")
+            await human_delay(1.2, 2.5)
+            return True
+
+    print("[!] Timed out waiting for additional jobs to load after clicking 'Load More Jobs'.")
+    return False
+
+
+async def extract_job_urls_with_pagination(page, target_count: int = 30, max_clicks: int = 3) -> list[str]:
+    print("[*] Waiting for Upwork Nuxt feed to hydrate...")
+    await check_and_wait_for_captcha(page)
+
+    try:
+        await page.wait_for_selector('a[href*="/jobs/"]', timeout=30000)
+    except PlaywrightTimeoutError:
+        print("[!] Timed out waiting for job links on the feed page.")
+        return []
+
+    await human_mouse_move(page, random.randint(250, 850), random.randint(250, 650))
+    await human_scroll(page, scrolls=2)
+
+    collected = await collect_visible_job_urls(page)
+    print(f"[*] Initial batch extracted: {len(collected)} unique jobs.")
+
+    clicks = 0
+    while len(collected) < target_count and clicks < max_clicks:
+        clicks += 1
+        print(f"[*] Paginating (Attempt {clicks}/{max_clicks}) to reach {target_count} jobs...")
+        loaded = await click_load_more_jobs(page, previous_count=len(collected))
+        if not loaded:
             break
-    return urls[:target_count]
+        collected = await collect_visible_job_urls(page)
+
+    return collected[:target_count]
 
 
 def extract_connects(soup: BeautifulSoup, rendered_text: str = "") -> str:
@@ -417,41 +577,101 @@ def parse_job_details(html_content: str, url: str, rendered_text: str = "") -> d
     }
 
 
-def save_xlsx(results: list[dict]):
+def save_xlsx_sheet(results: list[dict]):
     wb = Workbook()
     ws = wb.active
     ws.title = "Jobs Data"
+    ws.views.sheetView[0].showGridLines = True
+
+    navy_header = "1E2D3D"
+    zebra_bg = "F7F9FB"
+    white = "FFFFFF"
+    border_gray = "D5DCE4"
+
+    thin_side = Side(style="thin", color=border_gray)
+    med_navy = Side(style="medium", color=navy_header)
+    grid_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    header_border = Border(left=thin_side, right=thin_side, top=med_navy, bottom=med_navy)
 
     ws.append(STRUCTURED_FIELDS)
-    header_fill = PatternFill("solid", fgColor="1E2D3D")
-    header_font = Font(color="FFFFFF", bold=True)
     for col_idx in range(1, len(STRUCTURED_FIELDS) + 1):
         cell = ws.cell(row=1, column=col_idx)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.font = Font(name="Calibri", size=11, bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=navy_header)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_border
+    ws.row_dimensions[1].height = 28
 
     for r_idx, item in enumerate(results, start=2):
-        row_values = [
-            ", ".join(item.get(col, [])) if col == "skills" and isinstance(item.get(col), list) else item.get(col, "")
-            for col in STRUCTURED_FIELDS
-        ]
-        ws.append(row_values)
-        for c_idx in range(1, len(STRUCTURED_FIELDS) + 1):
-            ws.cell(row=r_idx, column=c_idx).alignment = Alignment(vertical="top", wrap_text=(STRUCTURED_FIELDS[c_idx - 1] == "description"))
+        fill_color = zebra_bg if r_idx % 2 == 1 else white
+        for c_idx, col_name in enumerate(STRUCTURED_FIELDS, start=1):
+            val = item.get(col_name, "")
+            if col_name == "skills" and isinstance(val, list):
+                val = ", ".join(val)
 
-    for c_idx in range(1, len(STRUCTURED_FIELDS) + 1):
-        ws.column_dimensions[get_column_letter(c_idx)].width = 22
+            cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            cell.font = Font(name="Calibri", size=10, color="1A202C")
+            cell.fill = PatternFill("solid", fgColor=fill_color)
+            cell.border = grid_border
+
+            if col_name == "url" and val:
+                cell.hyperlink = val
+                cell.font = Font(name="Calibri", size=10, color="1B5E20", underline="single")
+                cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=False)
+            elif col_name == "description":
+                cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            else:
+                cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+        desc_len = len(str(item.get("description", "")))
+        ws.row_dimensions[r_idx].height = min(140, max(24, (desc_len // 75 + 1) * 15))
+
+    col_widths = {
+        "scraped_at": 22,
+        "url": 42,
+        "title": 36,
+        "posted_at": 15,
+        "area": 14,
+        "time_required": 24,
+        "month_required": 18,
+        "experience": 15,
+        "rate": 24,
+        "connects_required": 18,
+        "client_from": 22,
+        "hired_till_now": 26,
+        "joined_at": 16,
+        "skills": 36,
+        "description": 52,
+        "proposals": 14,
+        "interviewing": 14,
+        "invites_sent": 14,
+        "unanswered_invites": 18,
+        "payment_info": 26,
+        "verified_or_not": 16,
+        "phone_verified_or_not": 20,
+        "last_view": 18,
+        "hire_rate": 13,
+        "open_jobs": 12,
+        "member_since": 16,
+    }
+    for c_idx, col_name in enumerate(STRUCTURED_FIELDS, start=1):
+        ws.column_dimensions[get_column_letter(c_idx)].width = col_widths.get(col_name, 18)
 
     ws.freeze_panes = "D2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(STRUCTURED_FIELDS))}{max(2, len(results) + 1)}"
+
+    dv_ver = DataValidation(type="list", formula1='"Verified,Not Verified"', allow_blank=True)
+    ws.add_data_validation(dv_ver)
+    ver_col_letter = get_column_letter(STRUCTURED_FIELDS.index("verified_or_not") + 1)
+    dv_ver.add(f"{ver_col_letter}2:{ver_col_letter}{max(2, len(results) + 1)}")
+
     wb.save(XLSX_OUTPUT_FILE)
 
 
 def save_results(results: list[dict]):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     JSON_OUTPUT_FILE.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    save_xlsx(results)
+    save_xlsx_sheet(results)
 
     cols = ["#"] + STRUCTURED_FIELDS
     th_row = "".join(f"<th onclick='sortCol({i})'>{c}</th>" for i, c in enumerate(cols))
@@ -557,37 +777,96 @@ filterRows();
 async def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ws_url = ensure_edge_remote_debugging_ready()
-    results = []
+
+    results: list[dict] = []
     save_results(results)
 
     async with async_playwright() as p:
+        print("[*] Connecting to your existing Edge session (Person 1 / Default)...")
         position_edge_right_half_and_focus()
-        browser = await p.chromium.connect_over_cdp(ws_url, timeout=60000)
+        print("    >>> LOOK AT YOUR EDGE WINDOW AND CLICK 'ALLOW' WHEN THE POPUP APPEARS <<<")
+        try:
+            browser = await p.chromium.connect_over_cdp(ws_url, timeout=60000)
+        except Exception as e:
+            print(
+                "\n[!] Connection failed or timed out.\n"
+                "    - Make sure you clicked 'Allow' on the Edge permission popup.\n"
+                f"    Error: {e}"
+            )
+            return
+
         context = browser.contexts[0]
         page = context.pages[0] if context.pages else await context.new_page()
+
         position_edge_right_half_and_focus()
         await page.bring_to_front()
 
         try:
+            print(f"[*] Navigating to {TARGET_URL}...")
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
+
             await ensure_logged_in(page)
 
-            job_urls = await extract_job_urls(page, target_count=TARGET_JOB_COUNT, max_clicks=MAX_LOAD_MORE_CLICKS)
-            for idx, job_url in enumerate(job_urls, start=1):
-                print(f"[{idx}/{len(job_urls)}] {job_url}")
-                try:
-                    await page.goto(f"{job_url}?referrer_url_path=find_work_home", wait_until="domcontentloaded", referer=TARGET_URL, timeout=45000)
-                    await page.wait_for_selector('.job-details-content, [data-test="Description"], main h1, main h4', timeout=25000)
-                except PlaywrightTimeoutError:
-                    continue
-                await asyncio.sleep(2.0)
-                rendered_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-                results.append(parse_job_details(await page.content(), job_url, rendered_text=rendered_text))
-                save_results(results)
+            job_urls = await extract_job_urls_with_pagination(
+                page,
+                target_count=TARGET_JOB_COUNT,
+                max_clicks=MAX_LOAD_MORE_CLICKS,
+            )
+            print(f"[+] Total unique job URLs collected: {len(job_urls)}")
 
-            print(f"[+] Done. Saved to {OUTPUT_DIR.resolve()}")
+            if not job_urls:
+                print("[!] No job URLs found. Check if Upwork loaded properly in the browser tab.")
+                return
+
+            for idx, job_url in enumerate(job_urls, start=1):
+                nav_url = f"{job_url}?referrer_url_path=find_work_home"
+                print(f"\n[{idx}/{len(job_urls)}] Visiting: {job_url}")
+                await human_delay(2.5, 5.0)
+
+                await human_mouse_move(page, random.randint(200, 950), random.randint(200, 650))
+
+                try:
+                    await page.goto(nav_url, wait_until="domcontentloaded", referer=TARGET_URL, timeout=45000)
+                except PlaywrightTimeoutError:
+                    print(f"[!] Navigation timeout on {job_url}, skipping...")
+                    continue
+
+                await check_and_wait_for_captcha(page)
+
+                hydrated = False
+                try:
+                    await page.wait_for_selector(
+                        '.job-details-content, [data-test="Description"], .job-details-card, .cfe-ui-job-about-client, main h1, main h4',
+                        timeout=25000,
+                    )
+                    hydrated = True
+                except PlaywrightTimeoutError:
+                    page_title = await page.title()
+                    print(f"[!] Job details did not hydrate within 25s (Title: {page_title!r}, URL: {page.url})")
+
+                if not hydrated:
+                    continue
+
+                await human_delay(2.0, 4.0)
+                await human_scroll(page, scrolls=random.randint(2, 4))
+                await human_mouse_move(page, random.randint(300, 750), random.randint(250, 650))
+
+                html = await page.content()
+                rendered_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                job_data = parse_job_details(html, job_url, rendered_text=rendered_text)
+                results.append(job_data)
+                save_results(results)
+                print(f"    -> Scraped: {job_data['title']} | Connects: {job_data['connects_required']} | Hires: {job_data['hired_till_now']}")
+
+            print(
+                f"\n[+] Finished! Saved {len(results)} jobs inside folder '{OUTPUT_DIR.resolve()}':\n"
+                f"    - JSON : {JSON_OUTPUT_FILE.resolve()}\n"
+                f"    - XLSX : {XLSX_OUTPUT_FILE.resolve()}\n"
+                f"    - Sheet: {HTML_OUTPUT_FILE.resolve()}"
+            )
+
         finally:
-            pass
+            await page.close()
 
 
 if __name__ == "__main__":
